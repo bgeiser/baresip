@@ -12,6 +12,9 @@
 #include "audiounit.h"
 
 
+/* TODO: convert from app sample format to float */
+
+
 struct auplay_st {
 	const struct auplay *ap;      /* inheritance */
 	struct audiosess_st *sess;
@@ -20,6 +23,11 @@ struct auplay_st {
 	auplay_write_h *wh;
 	void *arg;
 	uint32_t sampsz;
+	AudioConverterRef conv;
+
+	uint8_t ch;
+	void *tmp;
+	size_t tmp_sampc;
 };
 
 
@@ -35,9 +43,42 @@ static void auplay_destructor(void *arg)
 	AudioUnitUninitialize(st->au);
 	AudioComponentInstanceDispose(st->au);
 
+	AudioConverterDispose(st->conv);
+
 	mem_deref(st->sess);
+	mem_deref(st->tmp);
 
 	pthread_mutex_destroy(&st->mutex);
+}
+
+
+static OSStatus input_proc(
+		  AudioConverterRef inAudioConverter,
+		  UInt32 *ioNumberDataPackets,
+		  AudioBufferList *ioData,
+		  AudioStreamPacketDescription **outDataPacketDescription,
+		  void *inUserData)
+{
+	struct auplay_st *st = inUserData;
+	auplay_write_h *wh;
+	void *arg;
+	size_t sampc;
+	size_t bytes;
+
+	sampc = *ioNumberDataPackets * st->ch;
+	bytes = *ioNumberDataPackets * st->ch * st->sampsz;
+
+	wh  = st->wh;
+	arg = st->arg;
+
+	ioData->mNumberBuffers = 1;
+	ioData->mBuffers[0].mNumberChannels = st->ch;
+	ioData->mBuffers[0].mData = st->tmp;
+	ioData->mBuffers[0].mDataByteSize = (uint32_t)bytes;
+
+	wh(st->tmp, sampc, arg);
+
+	return noErr;
 }
 
 
@@ -51,7 +92,8 @@ static OSStatus output_callback(void *inRefCon,
 	struct auplay_st *st = inRefCon;
 	auplay_write_h *wh;
 	void *arg;
-	uint32_t i;
+	int ret;
+	size_t sampc;
 
 	(void)ioActionFlags;
 	(void)inTimeStamp;
@@ -66,12 +108,28 @@ static OSStatus output_callback(void *inRefCon,
 	if (!wh)
 		return 0;
 
-	for (i = 0; i < ioData->mNumberBuffers; ++i) {
+	AudioBuffer *ab = &ioData->mBuffers[0];
+	sampc = ab->mDataByteSize / st->sampsz;
 
-		AudioBuffer *ab = &ioData->mBuffers[i];
+	UInt32 packet_size = (uint32_t)sampc / st->ch;
 
-		wh(ab->mData, ab->mDataByteSize/st->sampsz, arg);
+	ret = AudioConverterFillComplexBuffer(st->conv,
+					      input_proc,
+					      st,
+					      &packet_size,
+					      ioData,
+					      0);
+	if (ret) {
+		warning("audiounit: player:"
+			" AudioConverterFillComplexBuffer (%d)\n", ret);
 	}
+
+#if 0
+	if (packet_size != sampc) {
+		warning("packet size changed: %zu -> %u\n",
+			sampc, packet_size);
+	}
+#endif
 
 	return 0;
 }
@@ -107,7 +165,6 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 	AudioUnitElement outputBus = 0;
 	AURenderCallbackStruct cb;
 	struct auplay_st *st;
-	UInt32 enable = 1;
 	OSStatus ret = 0;
 	Float64 hw_srate = 0.0;
 	UInt32 hw_size = sizeof(hw_srate);
@@ -125,6 +182,7 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 	st->ap  = ap;
 	st->wh  = wh;
 	st->arg = arg;
+	st->ch  = prm->ch;
 
 	err = pthread_mutex_init(&st->mutex, NULL);
 	if (err)
@@ -138,17 +196,13 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 	if (ret)
 		goto out;
 
-	ret = AudioUnitSetProperty(st->au, kAudioOutputUnitProperty_EnableIO,
-				   kAudioUnitScope_Output, outputBus,
-				   &enable, sizeof(enable));
-	if (ret) {
-		warning("audiounit: EnableIO failed (%d)\n", ret);
-		goto out;
-	}
-
 	st->sampsz = (uint32_t)aufmt_sample_size(prm->fmt);
 
-	fmt.mSampleRate       = prm->srate;
+	st->tmp_sampc = prm->srate * prm->ch * prm->ptime / 1000;
+
+	st->tmp = mem_zalloc(st->tmp_sampc * st->sampsz, NULL);
+
+	fmt.mSampleRate       = 44100;
 	fmt.mFormatID         = kAudioFormatLinearPCM;
 #if TARGET_OS_IPHONE
 	fmt.mFormatFlags      = aufmt_to_formatflags(prm->fmt)
@@ -156,6 +210,7 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 		| kAudioFormatFlagIsPacked;
 #else
 	fmt.mFormatFlags      = aufmt_to_formatflags(prm->fmt)
+		| kAudioFormatFlagsNativeEndian
 		| kAudioFormatFlagIsPacked;
 #endif
 	fmt.mBitsPerChannel   = 8 * st->sampsz;
@@ -164,15 +219,20 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 	fmt.mFramesPerPacket  = 1;
 	fmt.mBytesPerPacket   = st->sampsz * prm->ch;
 
-	ret = AudioUnitInitialize(st->au);
-	if (ret)
-		goto out;
-
 	ret = AudioUnitSetProperty(st->au, kAudioUnitProperty_StreamFormat,
 				   kAudioUnitScope_Input, outputBus,
 				   &fmt, sizeof(fmt));
-	if (ret)
+	if (ret) {
+		warning("audiounit: player: format failed (%d)\n", ret);
 		goto out;
+	}
+
+	/* after setting format */
+	ret = AudioUnitInitialize(st->au);
+	if (ret) {
+		warning("audiounit: player: Initialize failed (%d)\n", ret);
+		goto out;
+	}
 
 	cb.inputProc = output_callback;
 	cb.inputProcRefCon = st;
@@ -184,8 +244,10 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 		goto out;
 
 	ret = AudioOutputUnitStart(st->au);
-	if (ret)
+	if (ret) {
+		warning("audiounit: player: Start failed (%d)\n", ret);
 		goto out;
+	}
 
 	ret = AudioUnitGetProperty(st->au,
 				   kAudioUnitProperty_SampleRate,
@@ -198,6 +260,26 @@ int audiounit_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 
 	debug("audiounit: player hardware sample rate is now at %f Hz\n",
 	      hw_srate);
+
+	/* resample: 48000 -> 44100 */
+
+	AudioStreamBasicDescription fmt_src;
+	AudioStreamBasicDescription fmt_dst;
+
+	fmt_src = fmt;
+	fmt_dst = fmt;
+
+	fmt_src.mSampleRate = prm->srate;
+	fmt_dst.mSampleRate = 44100;
+
+	ret = AudioConverterNew(&fmt_src,
+				&fmt_dst,
+				&st->conv);
+	if (ret) {
+		warning("audiounit: player: AudioConverter failed (%d)\n",
+			ret);
+		goto out;
+	}
 
  out:
 	if (ret) {

@@ -13,6 +13,10 @@
 #include "audiounit.h"
 
 
+/* todo: convert from "float" to application format */
+/* todo: convert from 44100 Hz to application srate */
+
+
 struct ausrc_st {
 	const struct ausrc *as;      /* inheritance */
 	struct audiosess_st *sess;
@@ -78,7 +82,8 @@ static OSStatus input_callback(void *inRefCon,
 			      inNumberFrames,
 			      &abl);
 	if (ret) {
-		debug("audiounit: record: AudioUnitRender error (%d)\n", ret);
+		warning("audiounit: record: AudioUnitRender error (%d)\n",
+			ret);
 		return ret;
 	}
 
@@ -120,15 +125,6 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	AudioUnitElement inputBus = 1;
 	AURenderCallbackStruct cb;
 	struct ausrc_st *st;
-	UInt32 enable = 1;
-#if ! TARGET_OS_IPHONE
-	UInt32 ausize = sizeof(AudioDeviceID);
-	AudioDeviceID inputDevice;
-	AudioObjectPropertyAddress auAddress = {
-		kAudioHardwarePropertyDefaultInputDevice,
-		kAudioObjectPropertyScopeGlobal,
-		kAudioObjectPropertyElementMaster };
-#endif
 	Float64 hw_srate = 0.0;
 	UInt32 hw_size = sizeof(hw_srate);
 	OSStatus ret = 0;
@@ -162,39 +158,6 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	if (ret)
 		goto out;
 
-	ret = AudioUnitSetProperty(st->au, kAudioOutputUnitProperty_EnableIO,
-				   kAudioUnitScope_Input, inputBus,
-				   &enable, sizeof(enable));
-	if (ret)
-		goto out;
-
-#if ! TARGET_OS_IPHONE
-	enable = 0;
-	ret = AudioUnitSetProperty(st->au, kAudioOutputUnitProperty_EnableIO,
-				   kAudioUnitScope_Output, 0,
-				   &enable, sizeof(enable));
-	if (ret)
-		goto out;
-
-	ret = AudioObjectGetPropertyData(kAudioObjectSystemObject,
-			&auAddress,
-			0,
-			NULL,
-			&ausize,
-			&inputDevice);
-	if (ret)
-		goto out;
-
-	ret = AudioUnitSetProperty(st->au,
-			kAudioOutputUnitProperty_CurrentDevice,
-			kAudioUnitScope_Global,
-			0,
-			&inputDevice,
-			sizeof(inputDevice));
-	if (ret)
-		goto out;
-#endif
-
 	st->sampsz = (uint32_t)aufmt_sample_size(prm->fmt);
 
 	fmt.mSampleRate       = prm->srate;
@@ -205,7 +168,8 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 		| kAudioFormatFlagIsPacked;
 #else
 	fmt.mFormatFlags      = aufmt_to_formatflags(prm->fmt)
-		| kLinearPCMFormatFlagIsPacked;
+		| kAudioFormatFlagsNativeEndian
+		| kAudioFormatFlagIsPacked;
 #endif
 	fmt.mBitsPerChannel   = 8 * st->sampsz;
 	fmt.mChannelsPerFrame = prm->ch;
@@ -217,13 +181,10 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	ret = AudioUnitSetProperty(st->au, kAudioUnitProperty_StreamFormat,
 				   kAudioUnitScope_Output, inputBus,
 				   &fmt, sizeof(fmt));
-	if (ret)
+	if (ret) {
+		warning("set prop: format\n");
 		goto out;
-
-	/* NOTE: done after desc */
-	ret = AudioUnitInitialize(st->au);
-	if (ret)
-		goto out;
+	}
 
 	cb.inputProc = input_callback;
 	cb.inputProcRefCon = st;
@@ -233,6 +194,13 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 				   &cb, sizeof(cb));
 	if (ret)
 		goto out;
+
+	/* NOTE: done after desc */
+	ret = AudioUnitInitialize(st->au);
+	if (ret) {
+		warning("init error (%d)\n", ret);
+		goto out;
+	}
 
 	ret = AudioOutputUnitStart(st->au);
 	if (ret)

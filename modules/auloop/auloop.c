@@ -45,8 +45,11 @@ struct audio_loop {
 	uint32_t ch;
 	enum aufmt fmt;
 
-	uint32_t n_read;
-	uint32_t n_write;
+	uint64_t n_read;
+	uint64_t n_write;
+
+	volatile bool src_started;
+	volatile bool play_started;
 };
 
 
@@ -71,14 +74,20 @@ static void auloop_destructor(void *arg)
 static void print_stats(struct audio_loop *al)
 {
 	double rw_ratio = 0.0;
+	double delta = (double)al->n_read - (double)al->n_write;
 
 	if (al->n_write)
-		rw_ratio = 1.0 * al->n_read / al->n_write;
+		rw_ratio = 1.0 * (double)al->n_read / (double)al->n_write;
 
 	(void)re_fprintf(stdout, "\r%uHz %dch %s "
-			 " n_read=%u n_write=%u rw_ratio=%.2f",
+			 " n_read=%.3f n_write=%.3f rw_ratio=%f"
+			 " delta=%.3f sec"
+			 "          "
+			 ,
 			 al->srate, al->ch, aufmt_name(al->fmt),
-			 al->n_read, al->n_write, rw_ratio);
+			 (double)al->n_read / (double)al->srate,
+			 (double)al->n_write / (double)al->srate, rw_ratio,
+			 delta / (double)al->srate);
 
 	if (str_isset(aucodec))
 		(void)re_fprintf(stdout, " codec='%s'", aucodec);
@@ -131,7 +140,12 @@ static void read_handler(const void *sampv, size_t sampc, void *arg)
 	size_t num_bytes = sampc * aufmt_sample_size(al->fmt);
 	int err;
 
-	++al->n_read;
+	al->src_started = true;
+
+	if (!al->play_started)
+		return;
+
+	al->n_read += sampc;
 
 	err = aubuf_write(al->ab, sampv, num_bytes);
 	if (err) {
@@ -146,7 +160,14 @@ static void write_handler(void *sampv, size_t sampc, void *arg)
 	size_t num_bytes = sampc * aufmt_sample_size(al->fmt);
 	int err;
 
-	++al->n_write;
+	al->play_started = true;
+
+	if (!al->src_started) {
+		memset(sampv, 0, num_bytes);
+		return;
+	}
+
+	al->n_write += sampc;
 
 	/* read from beginning */
 	if (al->ac) {

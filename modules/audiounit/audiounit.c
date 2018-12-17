@@ -40,9 +40,46 @@ static void interruptionListener(void *data, UInt32 inInterruptionState)
 #endif
 
 
+uint32_t audiounit_hardware_srate(void)
+{
+	AudioDeviceID device_id = kAudioObjectUnknown;
+	UInt32 info_size = sizeof(device_id);
+	AudioObjectPropertyAddress default_input_device_address = {
+		kAudioHardwarePropertyDefaultInputDevice,
+		kAudioObjectPropertyScopeGlobal,
+		kAudioObjectPropertyElementMaster
+	};
+
+	OSStatus result = AudioObjectGetPropertyData(kAudioObjectSystemObject,
+					     &default_input_device_address, 0,
+					     0, &info_size, &device_id);
+	if (result != noErr)
+		return 0;
+
+	Float64 nominal_sample_rate;
+	info_size = sizeof(nominal_sample_rate);
+
+	AudioObjectPropertyAddress nominal_sample_rate_address = {
+		kAudioDevicePropertyNominalSampleRate,
+		kAudioObjectPropertyScopeGlobal,
+		kAudioObjectPropertyElementMaster
+	};
+
+	result = AudioObjectGetPropertyData(device_id,
+					    &nominal_sample_rate_address,
+					    0, 0,
+					    &info_size, &nominal_sample_rate);
+	if (result != noErr)
+		return 0;
+
+	return nominal_sample_rate;
+}
+
+
 static int module_init(void)
 {
 	AudioComponentDescription desc;
+	CFStringRef name = NULL;
 	int err;
 
 #if TARGET_OS_IPHONE
@@ -56,11 +93,7 @@ static int module_init(void)
 #endif
 
 	desc.componentType = kAudioUnitType_Output;
-#if TARGET_OS_IPHONE
 	desc.componentSubType = kAudioUnitSubType_VoiceProcessingIO;
-#else
-	desc.componentSubType = kAudioUnitSubType_HALOutput;
-#endif
 	desc.componentManufacturer = kAudioUnitManufacturer_Apple;
 	desc.componentFlags = 0;
 	desc.componentFlagsMask = 0;
@@ -69,6 +102,11 @@ static int module_init(void)
 	if (!audiounit_comp) {
 		warning("audiounit: Voice Processing I/O not found\n");
 		return ENOENT;
+	}
+
+	if (0 == AudioComponentCopyName(audiounit_comp, &name)) {
+		info("audiounit: using component '%s'\n",
+		     CFStringGetCStringPtr(name, kCFStringEncodingUTF8));
 	}
 
 	err  = auplay_register(&auplay, baresip_auplayl(),
